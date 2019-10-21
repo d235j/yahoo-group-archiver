@@ -13,6 +13,8 @@ import datetime
 import math
 import logging
 
+from warcio import WARCWriter
+
 import requests
 
 # number of seconds to wait before trying again
@@ -537,6 +539,12 @@ class Mkchdir:
     def __exit__(self, exc_type, exc_value, traceback):
         os.chdir('..')
 
+def filter_cookies(warc_writer, request, response):
+    request.cookies = dict()
+    response.cookies = dict()
+    return request, response
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument('-us', '--username', type=str)
@@ -595,6 +603,12 @@ if __name__ == "__main__":
 
     with Mkchdir(args.group):
         logging.basicConfig(filename='archive.log', filemode='a', format='%(asctime)s ,%(msecs)03d %(levelname)s:%(name)s %(message)s', datefmt="%Y-%m-%d %H:%M:%S %Z", level=logging.DEBUG)
+
+        fhwarc = open('data.warc.gz', 'wb')
+
+        warc_writer = WARCWriter(fhwarc)
+        yga.ww = warc_writer
+
         if args.email:
             with Mkchdir('email'):
                 archive_email(yga, save=(not args.no_save), html=args.html)
@@ -625,3 +639,5 @@ if __name__ == "__main__":
         if args.members:
             with Mkchdir('members'):
                 archive_members(yga)
+
+        fhwarc.close()
