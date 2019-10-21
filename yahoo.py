@@ -12,7 +12,7 @@ import sys
 import requests
 import time
 import datetime
-
+import math
 
 # number of seconds to wait before trying again
 HOLDOFF=10
@@ -66,6 +66,9 @@ def archive_email(yga, save=True, html=True):
             except requests.exceptions.ReadTimeout:
                 print "ERROR: Read timeout, retrying"
                 time.sleep(HOLDOFF)
+            except requests.exceptions.HTTPError as err:
+                print "ERROR: Raw grab failed"
+                break
         if html:
 		    print "* Fetching message #%d of %d" % (id,count)
 		    for i in range(TRIES):
@@ -139,11 +142,64 @@ def archive_email(yga, save=True, html=True):
 		        f.write(json.dumps(html_json, indent=4))
         
 
+def process_single_attachment(yga, attach):
+    for frec in attach['files']:
+        print "** Fetching attachment '%s'" % (frec['filename'],)
+        if 'link' in frec:
+            # try and download the attachment
+            # (sometimes yahoo doesn't keep them)
+            for i in range(TRIES):
+                try:
+                    att = yga.get_file(frec['link'])
+                    break
+                except requests.exceptions.HTTPError as err:
+                    print "ERROR: can't download attachment, try %d: %s" % (i, err)
+                    time.sleep(HOLDOFF)
+
+        elif 'photoInfo' in frec:
+            # keep retrying until we find the largest image size we can download
+            # (sometimes yahoo doesn't keep the originals)
+            exclude = []
+            ok = False
+            while not ok:
+                # find best photoinfo (largest size)
+                photoinfo = get_best_photoinfo(frec['photoInfo'], exclude)
+
+                if photoinfo is None:
+                    print("ERROR: can't find a viable copy of this photo")
+                    break
+
+                # try and download it
+                for i in range(TRIES):
+                    try:
+                        att = yga.get_file(photoinfo['displayURL'])
+                        ok = True
+                        break
+                    except requests.exceptions.HTTPError as err:
+                        # yahoo says no. exclude this size and try for another.
+                        print "ERROR downloading '%s' variant, try %d: %s" % (photoinfo['photoType'], i, err)
+                        time.sleep(HOLDOFF)
+                        #exclude.append(photoinfo['photoType'])
+
+            # if we failed, try the next attachment
+            if not ok:
+                return None
+
+        fname = "%s-%s" % (frec['fileId'], basename(frec['filename']))
+        with file(fname, 'wb') as f:
+            f.write(att)
+
+
+
 def archive_files(yga, subdir=None):
-    if subdir:
-        file_json = yga.files(sfpath=subdir)
-    else:
-        file_json = yga.files()
+    try:
+        if subdir:
+            file_json = yga.files(sfpath=subdir)
+        else:
+            file_json = yga.files()
+    except Exception as e:
+        print "ERROR: Couldn't access Files functionality for this group"
+        return
 
     with open('fileinfo.json', 'w') as f:
         f.write(json.dumps(file_json['dirEntries'], indent=4))
@@ -166,8 +222,33 @@ def archive_files(yga, subdir=None):
                 pathURI = urllib.unquote(path['pathURI'])
                 archive_files(yga, subdir=pathURI)
 
+def archive_attachments(yga):
+    try:
+        attachments_json = yga.attachments()
+    except Exception as e:
+        print "ERROR: Couldn't access Files functionality for this group"
+        return
+
+    with open('allattachmentinfo.json', 'w') as f:
+        f.write(json.dumps(attachments_json['attachments'], indent=4))
+
+    n = 0
+    for a in attachments_json['attachments']:
+        n += 1
+        with Mkchdir(str(a['attachmentId'])):
+            a_json = yga.attachments(a['attachmentId'])
+            with open('attachmentinfo.json', 'w') as f:
+                f.write(json.dumps(a_json, indent=4))
+                process_single_attachment(yga, a_json)
+
+
+
 def archive_photos(yga):
-    nb_albums = yga.albums(count=5)['total'] + 1
+    try:
+        nb_albums = yga.albums(count=5)['total'] + 1
+    except Exception as e:
+        print "ERROR: Couldn't access Photos functionality for this group"
+        return
     albums = yga.albums(count=nb_albums)
     n = 0
 
@@ -211,14 +292,14 @@ def archive_db(yga, group):
             break
         except requests.exceptions.HTTPError as err:
             json = None
-            if err.response.status_code == 403:
-                # 403 error means Permission Denied. Retrying won't help.
+            if err.response.status_code == 403 or err.response.status_code == 401:
+                # 401 or 403 error means Permission Denied. Retrying won't help.
                 break
             print "HTTP error (sleeping before retry, try %d: %s" % (i, err)
             time.sleep(HOLDOFF)
 
     if json is None:
-        print "ERROR: Couldn't download databases"
+        print "ERROR: Couldn't access Database functionality for this group"
         return
 
     n = 0
@@ -234,7 +315,11 @@ def archive_db(yga, group):
 
 
 def archive_links(yga):
-    nb_links = yga.links(count=5)['total'] + 1
+    try:
+        nb_links = yga.links(count=5)['total'] + 1
+    except Exception as e:
+        print "ERROR: Couldn't access Links functionality for this group"
+        return
     links = yga.links(count=nb_links)
     n = 0
 
@@ -394,6 +479,32 @@ def archive_polls(yga):
             f.write(json.dumps(pollInfo, indent=4))
         n += 1
 
+def archive_members(yga):
+    for i in range(TRIES):
+        try:
+            confirmed_json = yga.members('confirmed')
+            break
+        except requests.exceptions.HTTPError as err:
+            confirmed_json = None
+            if err.response.status_code == 403 or err.response.status_code == 401:
+                # 401 or 403 error means Permission Denied. Retrying won't help.
+                print "Permission denied to access members."
+                return
+            print "HTTP error (sleeping before retry, try %d: %s" % (i, err)
+            time.sleep(HOLDOFF)
+    n_members = confirmed_json['total']
+    # we can dump 100 member records at a time
+    all_members = []
+    for i in range(int(math.ceil(n_members))/100 + 1):
+        confirmed_json = yga.members('confirmed', start=100*i, count=100)
+        all_members = all_members + confirmed_json['members']
+        with open('memberinfo_%d.json' % i, 'w') as f:
+            f.write(json.dumps(confirmed_json, indent=4))
+    all_json_data = {"total":n_members,"members":all_members}
+    with open('allmemberinfo.json', 'w') as f:
+        f.write(json.dumps(all_json_data, indent=4))
+    print "Saved members: Expected: %d, Actual: %d" % (n_members, len(all_members))
+
 
 class Mkchdir:
     d = ""
@@ -422,7 +533,9 @@ if __name__ == "__main__":
 
     po = p.add_argument_group(title='What to archive', description='By default, all the below.')
     po.add_argument('-e', '--email', action='store_true',
-            help='Only archive email and attachments')
+            help='Only archive email and attachments (from email)')
+    po.add_argument('-at', '--attachments', action='store_true',
+            help='Only archive attachments (from attachments list)')
     po.add_argument('-f', '--files', action='store_true',
             help='Only archive files')
     po.add_argument('-i', '--photos', action='store_true',
@@ -437,6 +550,8 @@ if __name__ == "__main__":
             help='Only archive polls')
     po.add_argument('-a', '--about', action='store_true',
             help='Only archive general info about the group')
+    po.add_argument('-m', '--members', action='store_true',
+            help='Only archive members')
 
     pe = p.add_argument_group(title='Email Options')
     pe.add_argument('-s', '--no-save', action='store_true',
@@ -459,8 +574,8 @@ if __name__ == "__main__":
             print "Login failed"
             sys.exit(1)
 
-    if not (args.email or args.files or args.photos or args.database or args.links or args.calendar or args.about or args.polls):
-        args.email = args.files = args.photos = args.database = args.links = args.calendar = args.about = args.polls = True
+    if not (args.email or args.files or args.photos or args.database or args.links or args.calendar or args.about or args.polls or args.attachments or args.members):
+        args.email = args.files = args.photos = args.database = args.links = args.calendar = args.about = args.polls = args.attachments = args.members = True
 
     with Mkchdir(args.group):
         if args.email:
@@ -487,3 +602,9 @@ if __name__ == "__main__":
         if args.polls:
             with Mkchdir('polls'):
                 archive_polls(yga)
+        if args.attachments:
+            with Mkchdir('attachments'):
+                archive_attachments(yga)
+        if args.members:
+            with Mkchdir('members'):
+                archive_members(yga)
